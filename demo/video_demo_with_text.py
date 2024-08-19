@@ -9,7 +9,7 @@ import resource
 import argparse
 import cv2
 import tqdm
-
+import numpy as np
 import torch
 from torch.multiprocessing import Pool, set_start_method
 
@@ -27,6 +27,51 @@ from utils import filter_and_update_tracks
 
 import warnings
 warnings.filterwarnings('ignore')
+
+num_classes = None
+
+def center_of_box(bbox):
+    bboxs = bbox.T
+    center_x = ((bboxs[0] + bboxs[2]) / 2).reshape(-1, 1)
+    center_y = ((bboxs[1] + bboxs[3]) / 2).reshape(-1, 1)
+    return np.concatenate((center_x, center_y), axis=1)
+
+# x_start, y_start, x_end, y_end
+def get_line_coefs(points):
+    x_start, y_start, x_end, y_end = points
+    a = (y_end - y_start) / (x_end - x_start)
+    b = y_start - a * x_start
+    return (a, b)
+
+def get_side(line_coefs, centers):
+    a, b = line_coefs
+    centers = centers.T
+    return np.sign(a * centers[0] + b - centers[1])
+
+# [[x_start, y_start, x_end, y_end], [x_start_2, y_start_2, x_end_2, y_end_2],...]
+stop_bar = [[187, 421, 970, 480], [792, 185, 951, 288]]
+
+def process_track_result(track_result, last_state=None):
+    global num_classes
+    centers = center_of_box(track_result[0].pred_track_instances.bboxes.numpy())
+    sides = get_side(get_line_coefs(stop_bar[0]), centers)
+    instances_id = track_result[0].pred_track_instances.instances_id.numpy()
+    new_state = {"side": dict(zip(instances_id, sides)), "violated": []}
+    if last_state != None:
+        new_state['violated'] = last_state['violated']
+        for key in last_state["side"]:
+            if (last_state["side"][key] < 0 
+                    and key in new_state["side"] 
+                    and new_state["side"][key] > 0):
+                print("Violated")
+                new_state['violated'].append(key)
+    
+    for key in new_state['violated']:
+        if key in new_state['side']:
+            idx = np.where(instances_id == key)[0][0]
+            track_result[0].pred_track_instances.labels[idx] = num_classes
+    return new_state
+
 
 # Ensure the right start method for multiprocessing
 try:
@@ -92,15 +137,7 @@ def main():
          'video) with the argument "--out" ')
 
     # build the model from a config file and a checkpoint file
-    if args.unified:
-        masa_model = init_masa(args.masa_config, args.masa_checkpoint, device=args.device)
-    else:
-        det_model = init_detector(args.det_config, args.det_checkpoint, palette='random', device=args.device)
-        masa_model = init_masa(args.masa_config, args.masa_checkpoint, device=args.device)
-        # build test pipeline
-        det_model.cfg.test_dataloader.dataset.pipeline[
-            0].type = 'mmdet.LoadImageFromNDArray'
-        test_pipeline = Compose(det_model.cfg.test_dataloader.dataset.pipeline)
+    masa_model = init_masa(args.masa_config, args.masa_checkpoint, device=args.device)
 
     if args.sam_mask:
         print('Loading SAM model...')
@@ -113,15 +150,12 @@ def main():
 
     #### parsing the text input
     texts = args.texts
-    if texts is not None:
-        masa_test_pipeline = build_test_pipeline(masa_model.cfg, with_text=True)
-    else:
-        masa_test_pipeline = build_test_pipeline(masa_model.cfg)
+    masa_test_pipeline = build_test_pipeline(masa_model.cfg, with_text=True)
+    global num_classes
+    num_classes = len(texts.split(' . '))
+    print(f"Num classes: {num_classes}")
 
-    if texts is not None:
-        masa_model.cfg.visualizer['texts'] = texts
-    else:
-        masa_model.cfg.visualizer['texts'] = det_model.dataset_meta['classes']
+    masa_model.cfg.visualizer['texts'] = texts
 
     # init visualizer
     masa_model.cfg.visualizer['save_dir'] = args.save_dir
@@ -129,7 +163,9 @@ def main():
     if args.sam_mask:
         masa_model.cfg.visualizer['alpha'] = 0.5
     visualizer = VISUALIZERS.build(masa_model.cfg.visualizer)
+    visualizer.set_stop_bar(stop_bar)
 
+    print((video_reader.width, video_reader.height))
     if args.out:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         video_writer = cv2.VideoWriter(
@@ -140,8 +176,8 @@ def main():
     instances_list = []
     frames = []
     fps_list = []
+    last_state = None
     for frame in track_iter_progress((video_reader, len(video_reader))):
-
         # unified models mean that masa build upon and reuse the foundation model's backbone features for tracking
         if args.unified:
             track_result = inference_masa(masa_model, frame,
@@ -154,38 +190,7 @@ def main():
                                           show_fps=args.show_fps)
             if args.show_fps:
                 track_result, fps = track_result
-        else:
-
-            if args.detector_type == 'mmdet':
-                result = inference_detector(det_model, frame,
-                                            text_prompt=texts,
-                                            test_pipeline=test_pipeline,
-                                            fp16=args.fp16)
-
-            # Perfom inter-class NMS to remove nosiy detections
-            det_bboxes, keep_idx = batched_nms(boxes=result.pred_instances.bboxes,
-                                               scores=result.pred_instances.scores,
-                                               idxs=result.pred_instances.labels,
-                                               class_agnostic=True,
-                                               nms_cfg=dict(type='nms',
-                                                             iou_threshold=0.5,
-                                                             class_agnostic=True,
-                                                             split_thr=100000))
-
-            det_bboxes = torch.cat([det_bboxes,
-                                            result.pred_instances.scores[keep_idx].unsqueeze(1)],
-                                               dim=1)
-            det_labels = result.pred_instances.labels[keep_idx]
-
-            track_result = inference_masa(masa_model, frame, frame_id=frame_idx,
-                                          video_len=len(video_reader),
-                                          test_pipeline=masa_test_pipeline,
-                                          det_bboxes=det_bboxes,
-                                          det_labels=det_labels,
-                                          fp16=args.fp16,
-                                          show_fps=args.show_fps)
-            if args.show_fps:
-                track_result, fps = track_result
+                last_state = process_track_result(track_result, last_state)
 
         frame_idx += 1
         if 'masks' in track_result[0].pred_track_instances:

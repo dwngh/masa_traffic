@@ -76,9 +76,14 @@ class MasaTrackLocalVisualizer(Visualizer):
                 class_names = list(filter(lambda x: len(x) > 0, original_caption))
             else:
                 class_names = list(texts)
+            class_names.append("violated_vehicle")
             self.label_names = class_names
         else:
             self.label_names = None
+        
+    
+    def set_stop_bar(self, stop_bar):
+        self.stop_bar = stop_bar
 
     def _draw_instances(
         self, image: np.ndarray, instances: ["InstanceData"]
@@ -111,6 +116,15 @@ class MasaTrackLocalVisualizer(Visualizer):
                 alpha=self.alpha,
                 line_widths=self.line_width,
             )
+
+            for start_end in self.stop_bar:
+                self.draw_lines(
+                    np.array([start_end[0], start_end[2]]),
+                    np.array([start_end[1], start_end[3]]),
+                    line_widths=self.line_width + 5,
+                )
+            violated_index = len(self.label_names) - 1
+            
             # draw texts
             positions = bboxes[:, :2] - self.line_width
             areas = (bboxes[:, 3] - bboxes[:, 1]) * (bboxes[:, 2] - bboxes[:, 0])
@@ -138,10 +152,10 @@ class MasaTrackLocalVisualizer(Visualizer):
                     font_sizes=int(13 * scales[i]),
                     bboxes=[
                         {
-                            "facecolor": [c / 255 for c in colors[i]],
+                            "facecolor": [c / 255 for c in colors[i]] if label != violated_index else "red",
                             "alpha": 0.8,
                             "pad": 0.7,
-                            "edgecolor": "none",
+                            "edgecolor": "none"  if label != violated_index else "red",
                         }
                     ],
                 )
